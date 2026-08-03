@@ -216,3 +216,85 @@ def upscale_nested_latent(
             out["noise_mask"] = upscale_video_latent(noise_mask, scale_by, method)
 
     return out
+
+
+def _has_nonzero(samples: Any) -> bool:
+    """NestedTensor-safe replacement for torch.count_nonzero(samples) > 0."""
+    members, _ = extract_tensor(samples)
+    return any(torch.count_nonzero(t) > 0 for t in members)
+
+
+def add_noise_nested_latent(
+    model: Any,
+    noise: Any,
+    sigmas: torch.Tensor,
+    latent: dict,
+) -> dict:
+    """NestedTensor-aware AddNoise for CONST/flow DisableNoise continuation.
+
+    Stock AddNoise:
+      - crashes on NestedTensor (count_nonzero / sigma * NestedTensor)
+      - leaves samples in noise_scaling() space
+
+    SamplerCustomAdvanced + DisableNoise on CONST flow then does:
+      x = (1 - sigmas[0]) * latent
+    which matches a prior sampler's `output` only because that output was run through
+    inverse_noise_scaling(sigmas[-1]). Feeding raw noise_scaling() results therefore
+    gets dampened again → soft second-pass sampling.
+
+    This helper mixes with sigmas[0], then inverse_noise_scaling(sigmas[0]) so
+    DisableNoise reconstitutes the intended noisy latent.
+    """
+    if len(sigmas) == 0:
+        return latent
+
+    if "samples" not in latent:
+        raise KeyError('LATENT dict missing "samples"')
+
+    out = latent.copy()
+    latent_image = latent["samples"]
+    noisy = noise.generate_noise(latent)
+
+    model_sampling = model.get_model_object("model_sampling")
+    process_latent_out = model.get_model_object("process_latent_out")
+    process_latent_in = model.get_model_object("process_latent_in")
+
+    # Use sampler-start sigma (not |σ0-σlast|) so DisableNoise's (1-σ0)*latent cancels
+    # inverse_noise_scaling exactly.
+    sigma_start = sigmas[0]
+
+    lat_members, was_nested = extract_tensor(latent_image)
+    noise_members, noise_was_nested = extract_tensor(noisy)
+    if len(lat_members) != len(noise_members):
+        raise ValueError(
+            f"Noise NestedTensor has {len(noise_members)} members but latent has {len(lat_members)}"
+        )
+
+    shift_latents = _has_nonzero(latent_image)
+
+    result_members: list[torch.Tensor] = []
+    for lat, noi in zip(lat_members, noise_members):
+        lat_i = process_latent_in(lat) if shift_latents else lat
+        mixed = model_sampling.noise_scaling(sigma_start, noi, lat_i)
+        # Store in the same space as SamplerCustomAdvanced `output` for CONST continue.
+        if hasattr(model_sampling, "inverse_noise_scaling"):
+            mixed = model_sampling.inverse_noise_scaling(sigma_start, mixed)
+        mixed = process_latent_out(mixed)
+        mixed = torch.nan_to_num(mixed, nan=0.0, posinf=0.0, neginf=0.0)
+        result_members.append(mixed)
+
+    out["samples"] = wrap_tensor(result_members, was_nested=was_nested or noise_was_nested)
+    return out
+
+
+def upscale_and_add_noise(
+    latent: dict,
+    scale_by: float,
+    method: str,
+    model: Any,
+    noise: Any,
+    sigmas: torch.Tensor,
+) -> dict:
+    """Spatial upscale then CONST/flow re-noise for a NestedTensor AV latent."""
+    upscaled = upscale_nested_latent(latent, scale_by, method)
+    return add_noise_nested_latent(model, noise, sigmas, upscaled)

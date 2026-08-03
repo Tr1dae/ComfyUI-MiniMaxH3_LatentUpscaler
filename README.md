@@ -72,11 +72,24 @@ LATENT dict
 - If `noise_mask` is NestedTensor, the video mask is scaled the same way; the audio mask is passed through.
 - Other LATENT dict keys are preserved via a shallow copy.
 
+### MiniMax H3 Latent Upscale Combined
+
+- **Inputs:** `LATENT`, `scale_by`, `method`, `MODEL`, `NOISE`, `SIGMAS`
+- **Output:** `LATENT` (upscaled + re-noised)
+- Same spatial upscale as above, then NestedTensor-safe AddNoise (stock `AddNoise` crashes on NestedTensor at `torch.count_nonzero`).
+- Prefer this for split-sampler / hires-style workflows.
+
+### MiniMax H3 Add Noise
+
+- NestedTensor-only counterpart of stock AddNoise (member-wise `process_latent_in` → `noise_scaling` → `process_latent_out`).
+
 ## Helpers (`utils.py`)
 
 - `extract_tensor(samples)` → `(list[Tensor], was_nested)`
 - `wrap_tensor(tensors, *, was_nested)` → NestedTensor via the official constructor, or a plain tensor
 - `upscale_nested_latent(latent, scale_by, method)` → full LATENT dict transform
+- `add_noise_nested_latent(model, noise, sigmas, latent)` → NestedTensor-safe AddNoise
+- `upscale_and_add_noise(...)` → upscale then re-noise
 
 ## Install
 
@@ -86,8 +99,39 @@ Package path:
 
 Restart ComfyUI (or reload custom nodes). Search the node menu under `latent/minimax_h3`.
 
-## Typical use
+## Typical use (split samplers / hires-style)
 
-1. Sample at base latent resolution.
-2. Insert **MiniMax H3 Latent Upscale** (`scale_by`, method).
-3. Continue sampling / decode with the upscaled NestedTensor latent.
+MiniMax H3 uses CONST flow sampling. Correct start-of-pass mixing is:
+
+`x = σ · noise + (1 − σ) · clean_latent`
+
+Do **not** upscale the live noisy `output` and resume with DisableNoise — that interpolates residual noise and causes large colored dots.
+
+Do **not** upscale `denoised_output` and resume with DisableNoise only — you feed nearly-clean latents into a low-σ tail, so pass 2 barely moves and looks soft.
+
+### Recommended wiring
+
+1. **SamplerCustomAdvanced #1** with high σ half (`SplitSigmas` high output).
+2. Take **`denoised_output`** (predicted clean / x0) — do **not** use `output` (noisy; upscaling it → colored dots).
+3. **MiniMax H3 Latent Upscale Combined**:
+   - `scale_by` / `method`
+   - `model` = same MiniMax model
+   - `noise` = **RandomNoise**
+   - `sigmas` = the **low** half from SplitSigmas (same schedule as sampler #2)
+4. **SamplerCustomAdvanced #2**:
+   - `noise` = **DisableNoise**
+   - `sigmas` = same low half
+   - `latent_image` = combined node output
+
+**Why soft results happened before:** MiniMax is CONST/flow. DisableNoise starts as `(1−σ)·latent`. Sampler `output` is already `inverse_noise_scaling`'d so this reconstitutes correctly. Stock-style AddNoise omitted that inverse step, so pass 2 dampened the mix again and looked soft. Combined now applies `inverse_noise_scaling(sigmas[0])` after mixing.
+
+**Note:** Stock ComfyUI `AddNoise` also fails on NestedTensor (`count_nonzero` TypeError). Use this pack’s Combined / Add Noise nodes.
+
+### Why the two SamplerCustomAdvanced sockets behave differently
+
+| Socket | What it is | After upscale + EmptyNoise resume |
+|--------|------------|-----------------------------------|
+| `output` | Latent still on the noise trajectory (`x` at end of pass 1) | Spatially warped noise → chromatic dots |
+| `denoised_output` | Model’s clean estimate (`x0`) | Soft / under-denoised unless you **AddNoise** at pass-2 σ |
+
+Upscaling is only a spatial resize. **AddNoise** restores a valid noisy latent at the new resolution for the second schedule.
