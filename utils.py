@@ -11,6 +11,13 @@ import comfy.nested_tensor
 
 UPSCALE_METHODS = ("nearest", "bilinear", "bicubic")
 
+# MiniMax DiT patch_size is (1, 2, 2); cond patchify does not pad, so H/W must be even.
+_SPATIAL_MULTIPLE = 2
+
+
+def _snap_spatial(size: int, multiple: int = _SPATIAL_MULTIPLE) -> int:
+    return max(multiple, ((int(size) + multiple - 1) // multiple) * multiple)
+
 
 def is_nested_tensor(obj: Any) -> bool:
     return isinstance(obj, comfy.nested_tensor.NestedTensor) or getattr(obj, "is_nested", False)
@@ -64,8 +71,8 @@ def upscale_video_latent(
     if video.ndim < 4:
         raise ValueError(f"Video latent needs at least 4 dims [B,C,H,W], got shape {tuple(video.shape)}")
 
-    height = max(1, round(video.shape[-2] * scale_by))
-    width = max(1, round(video.shape[-1] * scale_by))
+    height = _snap_spatial(max(1, round(video.shape[-2] * scale_by)))
+    width = _snap_spatial(max(1, round(video.shape[-1] * scale_by)))
 
     orig_shape = tuple(video.shape)
     samples = video
@@ -250,14 +257,23 @@ def upscale_and_add_noise(
 
 
 def _upscale_video_like_latent(z: torch.Tensor, scale_by: float, method: str) -> torch.Tensor:
-    """Upscale a MiniMax visual latent; supports 5D video or 4D image-like tensors."""
+    """Upscale a MiniMax visual latent; supports 5D video or 4D image-like tensors.
+
+    Snaps H/W to the DiT spatial patch multiple (2). Cond path patchify_video does not
+    pad, so odd sizes after 1.5× (e.g. 50→75) crash reshape.
+    """
     if not isinstance(z, torch.Tensor):
         raise TypeError(f"Expected torch.Tensor for visual latent, got {type(z)}")
     if z.ndim == 4:
-        # [B, C, H, W] — rare; treat as single-frame video
-        return upscale_video_latent(z.unsqueeze(2), scale_by, method).squeeze(2)
+        z5 = upscale_video_latent(z.unsqueeze(2), scale_by, method)
+        # pad T,H,W with MiniMax patch (1,2,2)
+        import comfy.ldm.common_dit as common_dit
+        z5 = common_dit.pad_to_patch_size(z5, (1, _SPATIAL_MULTIPLE, _SPATIAL_MULTIPLE))
+        return z5.squeeze(2)
     if z.ndim == 5:
-        return upscale_video_latent(z, scale_by, method)
+        z5 = upscale_video_latent(z, scale_by, method)
+        import comfy.ldm.common_dit as common_dit
+        return common_dit.pad_to_patch_size(z5, (1, _SPATIAL_MULTIPLE, _SPATIAL_MULTIPLE))
     raise ValueError(f"Visual latent needs 4 or 5 dims, got shape {tuple(z.shape)}")
 
 
