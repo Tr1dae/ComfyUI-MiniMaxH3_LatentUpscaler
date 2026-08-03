@@ -26,9 +26,8 @@ class MiniMaxH3LatentUpscaleCombined:
     FUNCTION = "upscale_noise"
     CATEGORY = "latent/minimax_h3"
     DESCRIPTION = (
-        "Upscale MiniMax H3 NestedTensor video (H, W), then re-noise for CONST/flow "
-        "DisableNoise continuation (noise_scaling + inverse_noise_scaling at sigmas[0]). "
-        "Parks the LATENT on CPU and soft-clears CUDA cache (does NOT unload models). "
+        "Upscale MiniMax H3 NestedTensor video (H, W), re-noise video only for CONST/flow "
+        "DisableNoise continuation; leave audio clean (not remixed). "
         "Feed denoised_output from sampler #1; use DisableNoise on sampler #2 with the same sigmas. "
         "Do not put Easy-Use Empty Cache / forced unload between samplers."
     )

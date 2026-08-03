@@ -9,12 +9,14 @@ Not a learned AI upscaler. Stock `LatentUpscaleBy` / `AddNoise` break on MiniMax
 **MiniMax H3 Latent Upscale Combined** (`latent/minimax_h3`)
 
 Inputs: `LATENT`, `scale_by`, `method` (`nearest` | `bilinear` | `bicubic`), `MODEL`, `NOISE`, `SIGMAS`  
-Output: `LATENT` (video spatially upscaled; audio unchanged; CONST-ready re-noise)
+Output: `LATENT` (video spatially upscaled + re-noised; **audio shape unchanged and not re-noised**)
 
 Does:
 
-1. Upscale NestedTensor video `H,W` via `F.interpolate`
-2. Re-noise at `sigmas[0]` with `noise_scaling` + `inverse_noise_scaling` so **DisableNoise** on sampler #2 reconstitutes correctly under CONST/flow
+1. Upscale NestedTensor video `H,W` via `F.interpolate` (audio tensor passed through)
+2. Re-noise **video only** at `sigmas[0]` (`noise_scaling` + `inverse_noise_scaling`)
+3. Keep **audio clean** (inverse-scaled for DisableNoise so pass 2 starts on clean audio, not dampened `(1−σ)·audio`)
+4. Park LATENT on CPU + `soft_empty_cache` (no model unload)
 
 ## Wiring
 
