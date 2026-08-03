@@ -142,6 +142,7 @@ def add_noise_nested_latent(
     latent: dict,
     *,
     renoise_indices: Sequence[int] | None = None,
+    noise_strengths: dict[int, float] | None = None,
 ) -> dict:
     """NestedTensor-aware AddNoise for CONST/flow DisableNoise continuation.
 
@@ -150,7 +151,10 @@ def add_noise_nested_latent(
 
     renoise_indices: members that get fresh noise mix. Default: all.
     Members not in the set stay clean but are still inverse-scaled so DisableNoise
-    reconstitutes clean (not (1-σ)·clean). For MiniMax H3 AV use (0,) = video only.
+    reconstitutes clean (not (1-σ)·clean).
+
+    noise_strengths: optional per-member multiplier on the noise tensor before
+    noise_scaling (e.g. {1: 0.5} half-strength audio remix). Missing keys = 1.0.
     """
     if len(sigmas) == 0:
         return latent
@@ -189,9 +193,18 @@ def add_noise_nested_latent(
     for i, (lat, noi) in enumerate(zip(lat_members, noise_members)):
         lat_i = process_latent_in(lat) if shift_latents else lat
         if i in renoise_set:
-            mixed = model_sampling.noise_scaling(sigma_start, noi, lat_i)
+            strength = 1.0
+            if noise_strengths is not None:
+                strength = float(noise_strengths.get(i, 1.0))
+            strength = max(0.0, min(1.0, strength))
+            if strength <= 0.0:
+                mixed = lat_i
+            elif strength >= 1.0:
+                mixed = model_sampling.noise_scaling(sigma_start, noi, lat_i)
+            else:
+                # Reduce noise amplitude -> lighter denoise on this stream.
+                mixed = model_sampling.noise_scaling(sigma_start, noi * strength, lat_i)
         else:
-            # No fresh noise — keep clean stream (e.g. MiniMax audio).
             mixed = lat_i
         if hasattr(model_sampling, "inverse_noise_scaling"):
             mixed = model_sampling.inverse_noise_scaling(sigma_start, mixed)
@@ -244,14 +257,38 @@ def upscale_and_add_noise(
     model: Any,
     noise: Any,
     sigmas: torch.Tensor,
+    *,
+    audio_denoise: float = 1.0,
 ) -> dict:
-    """Upscale video spatially; re-noise video only; keep audio clean (no remix)."""
+    """Upscale video spatially; re-noise video fully; optionally re-noise audio.
+
+    audio_denoise: 0 = keep pass-1 audio clean (pass 2 won't rewrite it much),
+    1 = full CONST remix of audio at sigmas[0] so pass 2 can improve it,
+    values in between scale the audio noise amplitude.
+    """
     upscaled = upscale_nested_latent(latent, scale_by, method)
     members, was_nested = extract_tensor(upscaled["samples"])
-    # MiniMax AV: [0]=video, [1]=audio — remix video only.
-    renoise = (0,) if was_nested and len(members) >= 2 else None
+    if was_nested and len(members) >= 2:
+        strength = max(0.0, min(1.0, float(audio_denoise)))
+        if strength <= 0.0:
+            renoise: tuple[int, ...] | None = (0,)
+            strengths = None
+        elif strength >= 1.0:
+            renoise = (0, 1)
+            strengths = None
+        else:
+            renoise = (0, 1)
+            strengths = {0: 1.0, 1: strength}
+    else:
+        renoise = None
+        strengths = None
     noised = add_noise_nested_latent(
-        model, noise, sigmas, upscaled, renoise_indices=renoise
+        model,
+        noise,
+        sigmas,
+        upscaled,
+        renoise_indices=renoise,
+        noise_strengths=strengths,
     )
     return finalize_latent_for_handoff(noised)
 

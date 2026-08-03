@@ -15,9 +15,12 @@ Not a learned AI upscaler. Stock `LatentUpscaleBy` / `AddNoise` break on MiniMax
 Does:
 
 1. Upscale NestedTensor video `H,W` via `F.interpolate` (audio tensor passed through)
-2. Re-noise **video only** at `sigmas[0]` (`noise_scaling` + `inverse_noise_scaling`)
-3. Keep **audio clean** (inverse-scaled for DisableNoise)
-4. If CONDITIONING is connected: spatially upscale `minimax_refs` / `minimax_keyframes` visual latents and sync `latent_h` / `latent_w` (ref audio left alone)
+2. Re-noise **video** at `sigmas[0]` (`noise_scaling` + `inverse_noise_scaling`)
+3. **`audio_denoise`** (0–1): how much to re-noise audio for pass 2  
+   - `0` = lock pass-1 audio  
+   - `1` = full remix so sampler 2 can improve audio  
+   - `0.25–0.5` = light polish  
+4. If CONDITIONING is connected: spatially upscale `minimax_refs` / `minimax_keyframes` visual latents and sync `latent_h` / `latent_w`  
 5. Park LATENT on CPU + `soft_empty_cache` (no model unload)
 
 ## Wiring
@@ -26,12 +29,13 @@ Does:
 2. Take **`denoised_output`**
 3. **MiniMax H3 Latent Upscale Combined**
    - latent = denoised_output  
-   - positive/negative = same cond used for pass 1 (ref2va / keyframes)  
+   - positive/negative = same cond used for pass 1  
    - RandomNoise + low sigmas + model  
-4. Build a **new Guider** from Combined’s returned `positive` / `negative` (do **not** reuse the pass-1 Guider)  
+   - `audio_denoise` = `1.0` (or `0.35` for gentler audio edits)
+4. Build a **new Guider** from Combined’s returned `positive` / `negative`  
 5. SamplerCustomAdvanced #2 — DisableNoise + low sigmas + Combined latent + new Guider  
 
-Skipping step 4 leaves ref identity at the old canvas scale → warping / ghosting / seams after 2×.
+If audio garbles with `audio_denoise>0`, run more of the schedule in pass 1 (audio settles late) or lower `audio_denoise`.
 
 ### Why conditioning must scale (ref2va)
 
