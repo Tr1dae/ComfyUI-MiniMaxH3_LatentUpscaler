@@ -8,39 +8,38 @@ Not a learned AI upscaler. Stock `LatentUpscaleBy` / `AddNoise` break on MiniMax
 
 **MiniMax H3 Latent Upscale Combined** (`latent/minimax_h3`)
 
-Inputs: `LATENT`, `scale_by`, `method` (`nearest` | `bilinear` | `bicubic`), `MODEL`, `NOISE`, `SIGMAS`  
-Output: `LATENT` (video spatially upscaled + re-noised; **audio shape unchanged and not re-noised**)
+**Required inputs:** `LATENT`, `scale_by`, `method`, `MODEL`, `NOISE`, `SIGMAS`  
+**Optional inputs:** `positive`, `negative` (`CONDITIONING`)  
+**Outputs:** `latent`, `positive`, `negative`
 
 Does:
 
 1. Upscale NestedTensor video `H,W` via `F.interpolate` (audio tensor passed through)
 2. Re-noise **video only** at `sigmas[0]` (`noise_scaling` + `inverse_noise_scaling`)
-3. Keep **audio clean** (inverse-scaled for DisableNoise so pass 2 starts on clean audio, not dampened `(1−σ)·audio`)
-4. Park LATENT on CPU + `soft_empty_cache` (no model unload)
+3. Keep **audio clean** (inverse-scaled for DisableNoise)
+4. If CONDITIONING is connected: spatially upscale `minimax_refs` / `minimax_keyframes` visual latents and sync `latent_h` / `latent_w` (ref audio left alone)
+5. Park LATENT on CPU + `soft_empty_cache` (no model unload)
 
 ## Wiring
 
-1. SamplerCustomAdvanced #1 → high σ half (`SplitSigmas`)
-2. Take **`denoised_output`** (not `output` — upscaling noisy `output` → colored dots)
-3. **MiniMax H3 Latent Upscale Combined** — RandomNoise + low sigmas + same model
-4. SamplerCustomAdvanced #2 — **DisableNoise** + same low sigmas + combined output
+1. SamplerCustomAdvanced #1 → high/majority σ at low res  
+2. Take **`denoised_output`**
+3. **MiniMax H3 Latent Upscale Combined**
+   - latent = denoised_output  
+   - positive/negative = same cond used for pass 1 (ref2va / keyframes)  
+   - RandomNoise + low sigmas + model  
+4. Build a **new Guider** from Combined’s returned `positive` / `negative` (do **not** reuse the pass-1 Guider)  
+5. SamplerCustomAdvanced #2 — DisableNoise + low sigmas + Combined latent + new Guider  
 
-### VRAM between samplers (0.5MP → 2× → 1MP)
+Skipping step 4 leaves ref identity at the old canvas scale → warping / ghosting / seams after 2×.
 
-A clean single-pass 1MP run is not the same as pass1→upscale→pass2:
+### Why conditioning must scale (ref2va)
 
-- Pass 1 leaves MiniMax (and often CLIP/VAE) resident; `--disable-dynamic-vram` worsens reclaim.
-- 2× spatial ≈ **4×** video tokens (`H×W`), so pass-2 attention activations jump hard before weights settle.
-- Forced Empty Cache / `unload_all_models` mid-graph can leave logs like `0.00 MB usable, ~20GB offloaded`, then SageAttention Triton illegal memory access.
+`minimax_refs` packs each ref with its own `latent` + `latent_h`/`latent_w`. After the target canvas grows 2×, refs sized for the 0.5MP “match” canvas sit at the wrong relative scale and RoPE row layout vs the new target — classic identity warp. Combined doubles ref visual latents and metadata together.
 
-Combined node already parks the LATENT on CPU and calls `soft_empty_cache` only (no model unload).
+### VRAM between samplers
 
-Do:
-
-1. **No** Easy-Use Empty Cache / force-unload between sampler 1 and 2.
-2. Prefer keeping MiniMax loaded across both passes.
-3. If pass 2 still spasms: try removing `--disable-dynamic-vram`, or temporarily disable KJNodes MiniMax SageAttention for the high-res pass.
-4. Ensure CLIP/VAE aren’t pinned on GPU during pass 2 if you don’t need them yet.
+Avoid Easy-Use Empty Cache / force-unload between passes (especially with `--disable-dynamic-vram` + quantized MiniMax + SageAttention).
 
 ## Install
 

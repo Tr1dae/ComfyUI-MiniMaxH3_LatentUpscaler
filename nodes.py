@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
-from .utils import UPSCALE_METHODS, upscale_and_add_noise
+from .utils import (
+    UPSCALE_METHODS,
+    upscale_and_add_noise,
+    upscale_minimax_conditioning,
+)
 
 
 class MiniMaxH3LatentUpscaleCombined:
-    """Upscale NestedTensor video latents, then re-noise for DisableNoise continuation."""
+    """Upscale NestedTensor video latents + MiniMax ref/keyframe cond, then re-noise video."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -18,19 +22,37 @@ class MiniMaxH3LatentUpscaleCombined:
                 "model": ("MODEL",),
                 "noise": ("NOISE",),
                 "sigmas": ("SIGMAS",),
-            }
+            },
+            "optional": {
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+            },
         }
 
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("latent",)
+    RETURN_TYPES = ("LATENT", "CONDITIONING", "CONDITIONING")
+    RETURN_NAMES = ("latent", "positive", "negative")
     FUNCTION = "upscale_noise"
     CATEGORY = "latent/minimax_h3"
     DESCRIPTION = (
         "Upscale MiniMax H3 NestedTensor video (H, W), re-noise video only for CONST/flow "
-        "DisableNoise continuation; leave audio clean (not remixed). "
-        "Feed denoised_output from sampler #1; use DisableNoise on sampler #2 with the same sigmas. "
-        "Do not put Easy-Use Empty Cache / forced unload between samplers."
+        "DisableNoise continuation; leave audio clean. "
+        "Optionally upscale minimax_refs / minimax_keyframes visual latents (and latent_h/w) "
+        "so reference identity matches the new canvas — rebuild Guider from the returned CONDITIONING "
+        "for sampler #2. Do not force-unload VRAM between samplers."
     )
 
-    def upscale_noise(self, samples, scale_by, method, model, noise, sigmas):
-        return (upscale_and_add_noise(samples, scale_by, method, model, noise, sigmas),)
+    def upscale_noise(
+        self,
+        samples,
+        scale_by,
+        method,
+        model,
+        noise,
+        sigmas,
+        positive=None,
+        negative=None,
+    ):
+        latent = upscale_and_add_noise(samples, scale_by, method, model, noise, sigmas)
+        pos_out = upscale_minimax_conditioning(positive, scale_by, method)
+        neg_out = upscale_minimax_conditioning(negative, scale_by, method)
+        return (latent, pos_out, neg_out)

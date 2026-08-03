@@ -247,3 +247,85 @@ def upscale_and_add_noise(
         model, noise, sigmas, upscaled, renoise_indices=renoise
     )
     return finalize_latent_for_handoff(noised)
+
+
+def _upscale_video_like_latent(z: torch.Tensor, scale_by: float, method: str) -> torch.Tensor:
+    """Upscale a MiniMax visual latent; supports 5D video or 4D image-like tensors."""
+    if not isinstance(z, torch.Tensor):
+        raise TypeError(f"Expected torch.Tensor for visual latent, got {type(z)}")
+    if z.ndim == 4:
+        # [B, C, H, W] — rare; treat as single-frame video
+        return upscale_video_latent(z.unsqueeze(2), scale_by, method).squeeze(2)
+    if z.ndim == 5:
+        return upscale_video_latent(z, scale_by, method)
+    raise ValueError(f"Visual latent needs 4 or 5 dims, got shape {tuple(z.shape)}")
+
+
+def upscale_minimax_ref_block(block: dict, scale_by: float, method: str) -> dict:
+    """Spatially upscale one minimax_refs block; leave audio-only fields unchanged."""
+    out = dict(block)
+    kind = out.get("kind")
+    if kind == "audio":
+        return out
+
+    if "latent" in out and out["latent"] is not None:
+        z = _upscale_video_like_latent(out["latent"], scale_by, method)
+        out["latent"] = z
+        # PackedLayout reads these for RoPE / row counts — keep in sync with tensor.
+        if z.ndim == 5:
+            out["latent_h"] = int(z.shape[-2])
+            out["latent_w"] = int(z.shape[-1])
+            if "latent_t" in out:
+                out["latent_t"] = int(z.shape[2])
+        elif z.ndim == 4:
+            out["latent_h"] = int(z.shape[-2])
+            out["latent_w"] = int(z.shape[-1])
+
+    # audio_latent / ref_audio_t intentionally untouched (no spatial dims)
+    return out
+
+
+def upscale_minimax_keyframe(kf: dict, scale_by: float, method: str) -> dict:
+    """Upscale a minimax_keyframes entry so it matches the new target spatial grid."""
+    out = dict(kf)
+    if "latent" in out and out["latent"] is not None:
+        out["latent"] = _upscale_video_like_latent(out["latent"], scale_by, method)
+    return out
+
+
+def upscale_minimax_conditioning(
+    conditioning: list | None,
+    scale_by: float,
+    method: str,
+) -> list | None:
+    """Clone CONDITIONING and spatially upscale MiniMax ref/keyframe visual latents.
+
+    Updates minimax_refs[*].latent (+ latent_h/w/t) and minimax_keyframes[*].latent.
+    Text / audio cond tensors are left alone. Rebuild the Guider from the returned
+    conditioning for sampler #2 (do not reuse a Guider built on pre-upscale cond).
+    """
+    if conditioning is None:
+        return None
+
+    out: list = []
+    for entry in conditioning:
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            out.append(entry)
+            continue
+        emb, meta = entry[0], entry[1]
+        new_meta = meta.copy()
+
+        refs = meta.get("minimax_refs")
+        if refs is not None:
+            new_meta["minimax_refs"] = [
+                upscale_minimax_ref_block(blk, scale_by, method) for blk in refs
+            ]
+
+        keyframes = meta.get("minimax_keyframes")
+        if keyframes is not None:
+            new_meta["minimax_keyframes"] = [
+                upscale_minimax_keyframe(kf, scale_by, method) for kf in keyframes
+            ]
+
+        out.append([emb, new_meta])
+    return out
