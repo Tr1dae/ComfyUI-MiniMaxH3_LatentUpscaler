@@ -178,6 +178,40 @@ def add_noise_nested_latent(
     return out
 
 
+def _move_samples_to_cpu(samples: Any) -> Any:
+    """Detach NestedTensor / Tensor samples onto CPU for cheap cache between samplers."""
+    if is_nested_tensor(samples):
+        return samples.cpu()
+    if isinstance(samples, torch.Tensor):
+        return samples.detach().to("cpu")
+    return samples
+
+
+def finalize_latent_for_handoff(latent: dict) -> dict:
+    """Park LATENT on CPU and soft-clear CUDA cache without unloading models.
+
+    Forced unload / Easy-Use Empty Cache between MiniMax passes is unsafe with
+    quantized weights + --disable-dynamic-vram (ends as 0MB loaded / illegal
+    SageAttention access). Soft empty_cache only frees allocator fragments.
+    """
+    out = latent.copy()
+    if "samples" in out:
+        out["samples"] = _move_samples_to_cpu(out["samples"])
+    if "noise_mask" in out:
+        out["noise_mask"] = _move_samples_to_cpu(out["noise_mask"])
+
+    try:
+        import comfy.model_management as mm
+        import gc
+
+        gc.collect()
+        mm.soft_empty_cache()
+    except Exception:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return out
+
+
 def upscale_and_add_noise(
     latent: dict,
     scale_by: float,
@@ -188,4 +222,5 @@ def upscale_and_add_noise(
 ) -> dict:
     """Spatial upscale then CONST/flow re-noise for a NestedTensor AV latent."""
     upscaled = upscale_nested_latent(latent, scale_by, method)
-    return add_noise_nested_latent(model, noise, sigmas, upscaled)
+    noised = add_noise_nested_latent(model, noise, sigmas, upscaled)
+    return finalize_latent_for_handoff(noised)

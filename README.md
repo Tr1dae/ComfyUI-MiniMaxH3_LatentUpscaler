@@ -23,7 +23,22 @@ Does:
 3. **MiniMax H3 Latent Upscale Combined** — RandomNoise + low sigmas + same model
 4. SamplerCustomAdvanced #2 — **DisableNoise** + same low sigmas + combined output
 
-Avoid Easy-Use Empty Cache / forced model unload between the two samplers (can AV-crash quantized MiniMax).
+### VRAM between samplers (0.5MP → 2× → 1MP)
+
+A clean single-pass 1MP run is not the same as pass1→upscale→pass2:
+
+- Pass 1 leaves MiniMax (and often CLIP/VAE) resident; `--disable-dynamic-vram` worsens reclaim.
+- 2× spatial ≈ **4×** video tokens (`H×W`), so pass-2 attention activations jump hard before weights settle.
+- Forced Empty Cache / `unload_all_models` mid-graph can leave logs like `0.00 MB usable, ~20GB offloaded`, then SageAttention Triton illegal memory access.
+
+Combined node already parks the LATENT on CPU and calls `soft_empty_cache` only (no model unload).
+
+Do:
+
+1. **No** Easy-Use Empty Cache / force-unload between sampler 1 and 2.
+2. Prefer keeping MiniMax loaded across both passes.
+3. If pass 2 still spasms: try removing `--disable-dynamic-vram`, or temporarily disable KJNodes MiniMax SageAttention for the high-res pass.
+4. Ensure CLIP/VAE aren’t pinned on GPU during pass 2 if you don’t need them yet.
 
 ## Install
 
