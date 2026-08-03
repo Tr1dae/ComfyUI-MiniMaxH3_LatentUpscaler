@@ -1,4 +1,4 @@
-"""MiniMax H3 NestedTensor latent helpers: inspect, extract, wrap, upscale."""
+"""MiniMax H3 NestedTensor latent helpers: extract, wrap, upscale, CONST re-noise."""
 
 from __future__ import annotations
 
@@ -8,9 +8,6 @@ import torch
 import torch.nn.functional as F
 
 import comfy.nested_tensor
-
-# Attr names probed during inspection (Comfy NestedTensor does not define these).
-_PROBE_ATTRS = ("tensor", "values", "data", "mask", "storage", "payload")
 
 UPSCALE_METHODS = ("nearest", "bilinear", "bicubic")
 
@@ -52,96 +49,6 @@ def wrap_tensor(
     return tensors[0]
 
 
-def _public_attrs(obj: Any) -> list[str]:
-    return [name for name in dir(obj) if not name.startswith("_")]
-
-
-def _probe_attrs(obj: Any) -> dict[str, bool]:
-    return {name: hasattr(obj, name) for name in _PROBE_ATTRS}
-
-
-def _format_tensor(t: torch.Tensor, indent: str = "  ") -> list[str]:
-    return [
-        f"{indent}type: {type(t)}",
-        f"{indent}shape: {tuple(t.shape)}",
-        f"{indent}dtype: {t.dtype}",
-        f"{indent}device: {t.device}",
-        f"{indent}ndim: {t.ndim}",
-        f"{indent}requires_grad: {t.requires_grad}",
-    ]
-
-
-def inspect_value(obj: Any, name: str = "value", indent: str = "", depth: int = 0) -> str:
-    """Recursively describe a latent field (NestedTensor, Tensor, or other)."""
-    pad = indent
-    lines: list[str] = [f"{pad}{name}:"]
-    inner = indent + "  "
-
-    if is_nested_tensor(obj):
-        lines.append(f"{inner}type: {type(obj)}")
-        lines.append(f"{inner}is_nested: {getattr(obj, 'is_nested', None)}")
-        lines.append(f"{inner}public attrs: {_public_attrs(obj)}")
-        lines.append(f"{inner}probed attrs: {_probe_attrs(obj)}")
-        try:
-            lines.append(f"{inner}shape (first member): {tuple(obj.shape)}")
-        except Exception as e:
-            lines.append(f"{inner}shape: <error {e}>")
-        try:
-            lines.append(f"{inner}dtype: {obj.dtype}")
-            lines.append(f"{inner}device: {obj.device}")
-            lines.append(f"{inner}ndim: {obj.ndim}")
-        except Exception as e:
-            lines.append(f"{inner}dtype/device/ndim: <error {e}>")
-
-        members = list(getattr(obj, "tensors", obj.unbind()))
-        lines.append(f"{inner}member_count: {len(members)}")
-        for i, member in enumerate(members):
-            role = ""
-            if len(members) == 2:
-                role = " (video)" if i == 0 else " (audio)"
-            lines.append(f"{inner}tensors[{i}]{role}:")
-            if isinstance(member, torch.Tensor):
-                lines.extend(_format_tensor(member, indent=inner + "  "))
-            elif is_nested_tensor(member) and depth < 4:
-                lines.append(inspect_value(member, name=f"nested[{i}]", indent=inner + "  ", depth=depth + 1))
-            else:
-                lines.append(f"{inner}  type: {type(member)} repr={repr(member)[:200]}")
-        return "\n".join(lines)
-
-    if isinstance(obj, torch.Tensor):
-        lines.extend(_format_tensor(obj, indent=inner))
-        lines.append(f"{inner}probed attrs: {_probe_attrs(obj)}")
-        return "\n".join(lines)
-
-    if isinstance(obj, dict) and depth < 4:
-        lines.append(f"{inner}type: {type(obj)}")
-        lines.append(f"{inner}keys: {list(obj.keys())}")
-        for k, v in obj.items():
-            lines.append(inspect_value(v, name=str(k), indent=inner, depth=depth + 1))
-        return "\n".join(lines)
-
-    lines.append(f"{inner}type: {type(obj)}")
-    lines.append(f"{inner}repr: {repr(obj)[:300]}")
-    return "\n".join(lines)
-
-
-def inspect_latent(latent: dict) -> str:
-    """Full console-oriented report for a ComfyUI LATENT dict."""
-    lines = [
-        "=== MiniMaxH3 Latent Inspector ===",
-        f"type(latent): {type(latent)}",
-    ]
-    if not isinstance(latent, dict):
-        lines.append(f"expected dict, got: {repr(latent)[:300]}")
-        return "\n".join(lines)
-
-    lines.append(f"latent.keys(): {list(latent.keys())}")
-    for key, value in latent.items():
-        lines.append(inspect_value(value, name=f'latent["{key}"]'))
-    lines.append("=== end inspector ===")
-    return "\n".join(lines)
-
-
 def upscale_video_latent(
     video: torch.Tensor,
     scale_by: float,
@@ -168,9 +75,8 @@ def upscale_video_latent(
         samples = samples.movedim(2, 1)
         samples = samples.reshape(-1, orig_shape[1], orig_shape[-2], orig_shape[-1])
 
-    mode = method
-    if mode in ("bilinear", "bicubic"):
-        out = F.interpolate(samples, size=(height, width), mode=mode, align_corners=False)
+    if method in ("bilinear", "bicubic"):
+        out = F.interpolate(samples, size=(height, width), mode=method, align_corners=False)
     else:
         out = F.interpolate(samples, size=(height, width), mode="nearest")
 
@@ -194,11 +100,9 @@ def upscale_nested_latent(
     members, was_nested = extract_tensor(latent["samples"])
 
     if was_nested:
-        # MiniMax H3 / AV pattern: tensors[0]=video [B,24,T,H,W], tensors[1]=audio [B,32,2,Ta]
-        video = members[0]
-        rest = members[1:]
-        video_up = upscale_video_latent(video, scale_by, method)
-        out["samples"] = wrap_tensor([video_up, *rest], was_nested=True)
+        # MiniMax H3 / AV: tensors[0]=video [B,24,T,H,W], tensors[1]=audio [B,32,2,Ta]
+        video_up = upscale_video_latent(members[0], scale_by, method)
+        out["samples"] = wrap_tensor([video_up, *members[1:]], was_nested=True)
 
         noise_mask = latent.get("noise_mask")
         if noise_mask is not None and is_nested_tensor(noise_mask):
@@ -232,18 +136,8 @@ def add_noise_nested_latent(
 ) -> dict:
     """NestedTensor-aware AddNoise for CONST/flow DisableNoise continuation.
 
-    Stock AddNoise:
-      - crashes on NestedTensor (count_nonzero / sigma * NestedTensor)
-      - leaves samples in noise_scaling() space
-
-    SamplerCustomAdvanced + DisableNoise on CONST flow then does:
-      x = (1 - sigmas[0]) * latent
-    which matches a prior sampler's `output` only because that output was run through
-    inverse_noise_scaling(sigmas[-1]). Feeding raw noise_scaling() results therefore
-    gets dampened again → soft second-pass sampling.
-
-    This helper mixes with sigmas[0], then inverse_noise_scaling(sigmas[0]) so
-    DisableNoise reconstitutes the intended noisy latent.
+    Mixes at sigmas[0], then inverse_noise_scaling(sigmas[0]) so SamplerCustomAdvanced
+    + DisableNoise reconstitutes the intended noisy latent (CONST starts as (1-σ)·latent).
     """
     if len(sigmas) == 0:
         return latent
@@ -259,8 +153,6 @@ def add_noise_nested_latent(
     process_latent_out = model.get_model_object("process_latent_out")
     process_latent_in = model.get_model_object("process_latent_in")
 
-    # Use sampler-start sigma (not |σ0-σlast|) so DisableNoise's (1-σ0)*latent cancels
-    # inverse_noise_scaling exactly.
     sigma_start = sigmas[0]
 
     lat_members, was_nested = extract_tensor(latent_image)
@@ -276,7 +168,6 @@ def add_noise_nested_latent(
     for lat, noi in zip(lat_members, noise_members):
         lat_i = process_latent_in(lat) if shift_latents else lat
         mixed = model_sampling.noise_scaling(sigma_start, noi, lat_i)
-        # Store in the same space as SamplerCustomAdvanced `output` for CONST continue.
         if hasattr(model_sampling, "inverse_noise_scaling"):
             mixed = model_sampling.inverse_noise_scaling(sigma_start, mixed)
         mixed = process_latent_out(mixed)
